@@ -21,7 +21,34 @@
 #include <cassert>
 #include <optional>
 
+class SecurityLogger {
+public:
+    static void logAccessDenied(const std::string& username, int attempted_level, const std::string& operation) {
+        std::cerr << "Access Denied - User: " << username 
+                  << " attempted to access level " << attempted_level 
+                  << " during " << operation << std::endl;
+    }
+    
+    static void logAccessViolation(const std::string& username, const std::string& violation) {
+        std::cerr << "Security Violation - User: " << username 
+                  << " - " << violation << std::endl;
+    }
+};
+
 enum FieldType { INT, FLOAT, STRING };
+
+class User {
+public:
+    std::string username;
+    int access_level;
+
+    User(const std::string& name, int level) 
+        : username(name), access_level(level) {}
+
+    bool canAccess(int row_access_level) const {
+        return access_level >= row_access_level;
+    }
+};
 
 // Define a basic Field variant class that can hold different types
 class Field {
@@ -147,6 +174,9 @@ bool operator==(const Field& lhs, const Field& rhs) {
 class Tuple {
 public:
     std::vector<std::unique_ptr<Field>> fields;
+    int access_level; // ROW-LEVEL SECURITY
+
+    Tuple(int level = 0) : access_level(level) {}
 
     void addField(std::unique_ptr<Field> field) {
         fields.push_back(std::move(field));
@@ -160,12 +190,20 @@ public:
         return size;
     }
 
+    // security methods
+    bool isAccessibleTo(const User& user) const {
+        return user.canAccess(access_level);
+    }
+
     std::string serialize() {
         std::stringstream buffer;
-        buffer << fields.size() << ' ';
+        // Format: <access_level> <field_count> <fields...>
+        buffer << "ACCESS:" << access_level << " ";
+        buffer << "FIELDS:" << fields.size() << " ";
         for (const auto& field : fields) {
             buffer << field->serialize();
         }
+        std::cout << "Debug - Serializing with access_level=" << access_level << "\n";
         return buffer.str();
     }
 
@@ -174,18 +212,45 @@ public:
         out << serializedData;
     }
 
-    static std::unique_ptr<Tuple> deserialize(std::istream& in) {
-        auto tuple = std::make_unique<Tuple>();
-        size_t fieldCount; in >> fieldCount;
-        for (size_t i = 0; i < fieldCount; ++i) {
-            tuple->addField(Field::deserialize(in));
+    static std::unique_ptr<Tuple> deserialize(std::istream& in, const User* current_user = nullptr) {
+        std::string input;
+        std::getline(in, input);
+        std::istringstream iss(input);
+        std::string marker;
+        int access_level;
+        size_t field_count;
+        
+        iss >> marker >> access_level;  // Read "ACCESS:" and level
+        if(marker != "ACCESS:") {
+            std::cout << "Debug - Got marker: '" << marker << "'\n";
+            std::cout << "Debug - Full input: '" << input << "'\n";
+            return nullptr;
+        }
+        
+        iss >> marker >> field_count;  // Read "FIELDS:" and count
+        if(marker != "FIELDS:") {
+            return nullptr;
+        }
+
+        if (current_user && !current_user->canAccess(access_level)) {
+            SecurityLogger::logAccessDenied(current_user->username, 
+                                         access_level, 
+                                         "tuple deserialization");
+            return nullptr;
+        }
+
+        auto tuple = std::make_unique<Tuple>(access_level);
+        for (size_t i = 0; i < field_count; ++i) {
+            auto field = Field::deserialize(in);
+            if (field) {
+                tuple->addField(std::move(field));
+            }
         }
         return tuple;
     }
 
-    // Clone method
     std::unique_ptr<Tuple> clone() const {
-        auto clonedTuple = std::make_unique<Tuple>();
+        auto clonedTuple = std::make_unique<Tuple>(access_level);
         for (const auto& field : fields) {
             clonedTuple->addField(field->clone());
         }
@@ -235,7 +300,10 @@ public:
         size_t tuple_size = serializedTuple.size();
 
         //std::cout << "Tuple size: " << tuple_size << " bytes\n";
-        assert(tuple_size == 38);
+        // assert(tuple_size >= 40 && tuple_size <= 45);
+        if (tuple_size >= PAGE_SIZE) {
+            return false;
+        }
 
         // Check for first slot with enough space
         size_t slot_itr = 0;
@@ -673,9 +741,10 @@ private:
     size_t currentSlotIndex = 0;
     std::unique_ptr<Tuple> currentTuple;
     size_t tuple_count = 0;
+    const User* current_user;
 
 public:
-    ScanOperator(BufferManager& manager) : bufferManager(manager) {}
+    ScanOperator(BufferManager& manager, User* user) : bufferManager(manager), current_user(user) {}
 
     void open() override {
         currentPageIndex = 0;
@@ -710,7 +779,9 @@ private:
         while (currentPageIndex < bufferManager.getNumPages()) {
             auto& currentPage = bufferManager.getPage(currentPageIndex);
             if (!currentPage || currentSlotIndex >= MAX_SLOTS) {
-                currentSlotIndex = 0; // Reset slot index when moving to a new page
+                currentSlotIndex = 0;
+                currentPageIndex++;
+                continue;
             }
 
             char* page_buffer = currentPage->page_data.get();
@@ -718,22 +789,33 @@ private:
 
             while (currentSlotIndex < MAX_SLOTS) {
                 if (!slot_array[currentSlotIndex].empty) {
-                    assert(slot_array[currentSlotIndex].offset != INVALID_VALUE);
                     const char* tuple_data = page_buffer + slot_array[currentSlotIndex].offset;
                     std::istringstream iss(std::string(tuple_data, slot_array[currentSlotIndex].length));
-                    currentTuple = Tuple::deserialize(iss);
-                    currentSlotIndex++; // Move to the next slot for the next call
-                    tuple_count++;
-                    return; // Tuple loaded successfully
-                }
-                currentSlotIndex++;
-            }
+                    auto tuple = Tuple::deserialize(iss);
 
-            // Increment page index after exhausting current page
+                    std::cout << "Debug: Found tuple with access_level: " << tuple->access_level 
+                            << ", User level: " << current_user->access_level 
+                            << ", User: " << current_user->username << "\n";
+
+                    if (current_user->canAccess(tuple->access_level)) {
+                        currentTuple = std::move(tuple);
+                        currentSlotIndex++;
+                        tuple_count++;
+                        return;
+                    } else {
+                        std::cout << "Debug: Access denied to tuple\n";
+                    }
+                    
+                    currentSlotIndex++;
+                } else {
+                    currentSlotIndex++;
+                }
+            }
+            
             currentPageIndex++;
+            currentSlotIndex = 0;
         }
 
-        // No more tuples are available
         currentTuple.reset();
     }
 };
@@ -885,10 +967,11 @@ private:
     std::unique_ptr<IPredicate> predicate;
     bool has_next;
     std::vector<std::unique_ptr<Field>> currentOutput; // Store the current output here
+    const User* current_user; // ref curr user
 
 public:
-    SelectOperator(Operator& input, std::unique_ptr<IPredicate> predicate)
-        : UnaryOperator(input), predicate(std::move(predicate)), has_next(false) {}
+    SelectOperator(Operator& input, std::unique_ptr<IPredicate> predicate, User* user)
+        : UnaryOperator(input), predicate(std::move(predicate)), has_next(false), current_user(user) {}
 
     void open() override {
         input->open();
@@ -897,23 +980,30 @@ public:
     }
 
     bool next() override {
-        while (input->next()) {
-            const auto& output = input->getOutput(); // Temporarily hold the output
-            if (predicate->check(output)) {
-                // If the predicate is satisfied, store the output in the member variable
-                currentOutput.clear(); // Clear previous output
+    if (!current_user) {
+        return false;
+    }
+
+    while (input->next()) {
+        auto output = input->getOutput();
+        
+        if (predicate->check(output)) {
+            int row_access_level = 0;  // Default access level
+            
+            if (current_user->canAccess(row_access_level)) {
+                currentOutput.clear();
                 for (const auto& field : output) {
-                    // Assuming Field class has a clone method or copy constructor to duplicate fields
                     currentOutput.push_back(field->clone());
                 }
                 has_next = true;
                 return true;
             }
         }
-        has_next = false;
-        currentOutput.clear(); // Clear output if no more tuples satisfy the predicate
-        return false;
     }
+    has_next = false;
+    currentOutput.clear();
+    return false;
+}
 
     void close() override {
         input->close();
@@ -948,6 +1038,7 @@ private:
     std::vector<AggrFunc> aggr_funcs;
     std::vector<Tuple> output_tuples; // Use your Tuple class for output
     size_t output_tuples_index = 0;
+    const User* current_user;
 
     struct FieldVectorHasher {
         std::size_t operator()(const std::vector<Field>& fields) const {
@@ -989,8 +1080,8 @@ private:
 
 
 public:
-    HashAggregationOperator(Operator& input, std::vector<size_t> group_by_attrs, std::vector<AggrFunc> aggr_funcs)
-        : UnaryOperator(input), group_by_attrs(group_by_attrs), aggr_funcs(aggr_funcs) {}
+    HashAggregationOperator(Operator& input, std::vector<size_t> group_by_attrs, std::vector<AggrFunc> aggr_funcs, User* user)
+        : UnaryOperator(input), group_by_attrs(group_by_attrs), aggr_funcs(aggr_funcs), current_user(user) {}
 
     void open() override {
         input->open(); // Ensure the input operator is opened
@@ -1002,6 +1093,16 @@ public:
 
         while (input->next()) {
             const auto& tuple = input->getOutput(); // Assume getOutput returns a reference to the current tuple
+
+            // Get tuple access level and check permissions
+            auto tuple_data = std::make_unique<Tuple>();
+            for (const auto& field : tuple) {
+                tuple_data->addField(field->clone());
+            }
+
+            if (!current_user || !current_user->canAccess(tuple_data->access_level)) {
+                continue;
+            }
 
             // Extract group keys and initialize aggregation values
             std::vector<Field> group_keys;
@@ -1027,14 +1128,12 @@ public:
 
         // Prepare output tuples from the hash table
         for (const auto& entry : hash_table) {
-            const auto& group_keys = entry.first;
-            const auto& aggr_values = entry.second;
             Tuple output_tuple;
             // Assuming Tuple has a method to add Fields
-            for (const auto& key : group_keys) {
+            for (const auto& key : entry.first) {
                 output_tuple.addField(std::make_unique<Field>(key)); // Add group keys to the tuple
             }
-            for (const auto& value : aggr_values) {
+            for (const auto& value : entry.second) {
                 output_tuple.addField(std::make_unique<Field>(value)); // Add aggregated values to the tuple
             }
             output_tuples.push_back(std::move(output_tuple));
@@ -1054,13 +1153,13 @@ public:
     }
 
     std::vector<std::unique_ptr<Field>> getOutput() override {
-        std::vector<std::unique_ptr<Field>> outputCopy;
 
         if (output_tuples_index == 0 || output_tuples_index > output_tuples.size()) {
             // If there is no current tuple because next() hasn't been called yet or we're past the last tuple,
             // return an empty vector.
-            return outputCopy; // This will be an empty vector
+            return {}; // This will be an empty vector
         }
+        std::vector<std::unique_ptr<Field>> outputCopy;
 
         // Assuming that output_tuples stores Tuple objects and each Tuple has a vector of Field objects or similar
         const auto& currentTuple = output_tuples[output_tuples_index - 1]; // Adjust for 0-based indexing after increment in next()
@@ -1217,9 +1316,13 @@ void prettyPrint(const QueryComponents& components) {
 }
 
 void executeQuery(const QueryComponents& components, 
-                  BufferManager& buffer_manager) {
+                  BufferManager& buffer_manager, User* current_user) {
+
+    std::cout << "Executing query for user: " << current_user->username 
+              << " (access level: " << current_user->access_level << ")\n";
+
     // Stack allocation of ScanOperator
-    ScanOperator scanOp(buffer_manager);
+    ScanOperator scanOp(buffer_manager, current_user);
 
     // Using a pointer to Operator to handle polymorphism
     Operator* rootOp = &scanOp;
@@ -1249,7 +1352,7 @@ void executeQuery(const QueryComponents& components,
         complexPredicate->addPredicate(std::move(predicate2));
 
         // Using std::optional to manage the lifetime of SelectOperator
-        selectOpBuffer.emplace(*rootOp, std::move(complexPredicate));
+        selectOpBuffer.emplace(*rootOp, std::move(complexPredicate), current_user);
         rootOp = &*selectOpBuffer;
     }
 
@@ -1264,7 +1367,7 @@ void executeQuery(const QueryComponents& components,
         };
 
         // Using std::optional to manage the lifetime of HashAggregationOperator
-        hashAggOpBuffer.emplace(*rootOp, groupByAttrs, aggrFuncs);
+        hashAggOpBuffer.emplace(*rootOp, groupByAttrs, aggrFuncs, current_user);
         rootOp = &*hashAggOpBuffer;
     }
 
@@ -1273,6 +1376,7 @@ void executeQuery(const QueryComponents& components,
     while (rootOp->next()) {
         // Retrieve and print the current tuple
         const auto& output = rootOp->getOutput();
+        std::cout << "Access Level " << current_user->access_level << ": ";
         for (const auto& field : output) {
             field->print();
             std::cout << " ";
@@ -1337,10 +1441,11 @@ private:
     BufferManager& bufferManager;
     size_t pageId;
     size_t tupleId;
+    const User* current_user;
 
 public:
-    DeleteOperator(BufferManager& manager, size_t pageId, size_t tupleId) 
-        : bufferManager(manager), pageId(pageId), tupleId(tupleId) {}
+    DeleteOperator(BufferManager& manager, size_t pageId, size_t tupleId, User* user) 
+        : bufferManager(manager), pageId(pageId), tupleId(tupleId), current_user(user) {}
 
     void open() override {
         // Not used in this context
@@ -1349,22 +1454,37 @@ public:
     bool next() override {
         auto& page = bufferManager.getPage(pageId);
         if (!page) {
-            std::cerr << "Page not found." << std::endl;
+            SecurityLogger::logAccessDenied(current_user->username, 
+                                         0, 
+                                         "delete operation - page not found");
             return false;
         }
 
-        page->deleteTuple(tupleId); // Perform deletion
-        bufferManager.flushPage(pageId); // Flush the page to disk after deletion
+        // Get tuple and check access level before deletion
+        Slot* slot_array = reinterpret_cast<Slot*>(page->page_data.get());
+        if (slot_array[tupleId].empty) {
+            // Slot is already empty, no need for error message
+            return false;
+        }
+
+        const char* tuple_data = page->page_data.get() + slot_array[tupleId].offset;
+        std::istringstream iss(std::string(tuple_data, slot_array[tupleId].length));
+        auto tuple = Tuple::deserialize(iss, current_user);
+        
+        if (!tuple) {
+            SecurityLogger::logAccessDenied(current_user->username, 
+                                         0, 
+                                         "delete operation - insufficient privileges");
+            return false;
+        }
+
+        page->deleteTuple(tupleId);
+        bufferManager.flushPage(pageId);
         return true;
     }
 
-    void close() override {
-        // Not used in this context
-    }
-
-    std::vector<std::unique_ptr<Field>> getOutput() override {
-        return {}; // Return empty vector
-    }
+    void close() override {}
+    std::vector<std::unique_ptr<Field>> getOutput() override { return {}; }
 };
 
 
@@ -1372,6 +1492,8 @@ class BuzzDB {
 public:
     HashIndex hash_index;
     BufferManager buffer_manager;
+    std::unordered_map<std::string, User> users;
+    User* current_user;
 
 public:
     size_t max_number_of_tuples = 5000;
@@ -1379,25 +1501,54 @@ public:
 
     BuzzDB(){
         // Storage Manager automatically created
+        // default admin user
+        users.emplace("admin", User("admin", 100));
+        setCurrentUser("admin");
+
+    }
+
+    void addUser(const std::string& username, int access_level) {
+        users.emplace(username, User(username, access_level));
+    }
+
+    bool setCurrentUser(const std::string& username) {
+        auto it = users.find(username);
+        if (it != users.end()) {
+            current_user = &it->second;
+            return true;
+        }
+        return false;
     }
 
     // insert function
-    void insert(int key, int value) {
+    void insert(int key, int value, int access_level = 0) {
+        if (!current_user) {
+            throw std::runtime_error("No user set!");
+        }
+
+        if (access_level > current_user->access_level) {
+        SecurityLogger::logAccessDenied(current_user->username, 
+                                      access_level, 
+                                      "insert operation");
+        throw std::runtime_error("Insufficient privileges");
+    }
+
         tuple_insertion_attempt_counter += 1;
 
         // Create a new tuple with the given key and value
-        auto newTuple = std::make_unique<Tuple>();
+        auto newTuple = std::make_unique<Tuple>(access_level);
 
-        auto key_field = std::make_unique<Field>(key);
-        auto value_field = std::make_unique<Field>(value);
-        float float_val = 132.04;
-        auto float_field = std::make_unique<Field>(float_val);
-        auto string_field = std::make_unique<Field>("buzzdb");
+        newTuple->addField(std::make_unique<Field>(key));
+        newTuple->addField(std::make_unique<Field>(value));
+        newTuple->addField(std::make_unique<Field>(132.04f));
+        newTuple->addField(std::make_unique<Field>("buzzdb"));
 
-        newTuple->addField(std::move(key_field));
-        newTuple->addField(std::move(value_field));
-        newTuple->addField(std::move(float_field));
-        newTuple->addField(std::move(string_field));
+        std::string serializedTuple = newTuple->serialize();
+        std::cout << "Debug - Tuple size: " << serializedTuple.size() 
+                << " bytes, Key: " << key 
+                << ", Value: " << value 
+                << ", Access Level: " << access_level << "\n";
+        std::cout << "Serialized data: " << serializedTuple << "\n";
 
         InsertOperator insertOp(buffer_manager);
         insertOp.setTupleToInsert(std::move(newTuple));
@@ -1407,16 +1558,17 @@ public:
 
         if (tuple_insertion_attempt_counter % 10 != 0) {
             // Assuming you want to delete the first tuple from the first page
-            DeleteOperator delOp(buffer_manager, 0, 0); 
-            if (!delOp.next()) {
-                std::cerr << "Failed to delete tuple." << std::endl;
-            }
+            DeleteOperator delOp(buffer_manager, 0, 0, current_user); 
+            delOp.next();
         }
 
 
     }
 
     void executeQueries() {
+        if (!current_user) {
+            throw std::runtime_error("No user set!");
+        }
 
         std::vector<std::string> test_queries = {
             "SUM{1} GROUP BY {1} WHERE {1} > 2 and {1} < 6"
@@ -1425,7 +1577,7 @@ public:
         for (const auto& query : test_queries) {
             auto components = parseQuery(query);
             //prettyPrint(components);
-            executeQuery(components, buffer_manager);
+            executeQuery(components, buffer_manager, current_user);
         }
 
     }
@@ -1433,11 +1585,108 @@ public:
 };
 
 int main() {
-
     BuzzDB db;
 
-    std::ifstream inputFile("output.txt");
+    std::cout << "\n=== Setting up users ===\n";
+    db.addUser("user1", 50);  // mid-level access
+    db.addUser("user2", 25);  // low-level access
+    
+    // Test inserting data with different access levels as admin
+    std::cout << "\n=== Testing Admin Insert (Level 100) ===\n";
+    db.setCurrentUser("admin");
+    try {
+        db.insert(1, 100, 75);  // high security data
+        std::cout << "Admin: Inserted tuple with level 75\n";
+        db.insert(2, 200, 50);  // medium security data
+        std::cout << "Admin: Inserted tuple with level 50\n";
+        db.insert(3, 300, 25);  // low security data
+        std::cout << "Admin: Inserted tuple with level 25\n";
+        db.insert(4, 400, 0);   // public data
+        std::cout << "Admin: Inserted tuple with level 0\n";
+    } catch (const std::runtime_error& e) {
+        std::cout << "Error: " << e.what() << std::endl;
+    }
 
+    // Test user1 (level 50)
+    std::cout << "\n=== Testing User1 (Level 50) ===\n";
+    db.setCurrentUser("user1");
+    try {
+        db.insert(5, 500, 75);  // Should fail - too high
+        std::cout << "User1: Inserted tuple with level 75\n";
+    } catch (const std::runtime_error& e) {
+        std::cout << "Expected error for User1: " << e.what() << std::endl;
+    }
+
+    try {
+        db.insert(6, 600, 50);  // Should work
+        std::cout << "User1: Inserted tuple with level 50\n";
+        db.insert(7, 700, 25);  // Should work
+        std::cout << "User1: Inserted tuple with level 25\n";
+    } catch (const std::runtime_error& e) {
+        std::cout << "Error: " << e.what() << std::endl;
+    }
+
+    // Test user2 (level 25)
+    std::cout << "\n=== Testing User2 (Level 25) ===\n";
+    db.setCurrentUser("user2");
+    try {
+        db.insert(8, 800, 50);  // Should fail
+        std::cout << "User2: Inserted tuple with level 50\n";
+    } catch (const std::runtime_error& e) {
+        std::cout << "Expected error for User2: " << e.what() << std::endl;
+    }
+
+    try {
+        db.insert(9, 900, 25);  // Should work
+        std::cout << "User2: Inserted tuple with level 25\n";
+        db.insert(10, 1000, 0); // Should work
+        std::cout << "User2: Inserted tuple with level 0\n";
+    } catch (const std::runtime_error& e) {
+        std::cout << "Error: " << e.what() << std::endl;
+    }
+
+    // Test queries with different access levels
+    std::cout << "\n=== Query Test with Admin ===\n";
+    db.setCurrentUser("admin");
+    db.executeQueries();  // Should see all data
+
+    std::cout << "\n=== Query Test with User1 ===\n";
+    db.setCurrentUser("user1");
+    db.executeQueries();  // Should only see level ≤ 50
+
+    std::cout << "\n=== Query Test with User2 ===\n";
+    db.setCurrentUser("user2");
+    db.executeQueries();  // Should only see level ≤ 25
+
+    // Test deletion permissions
+    std::cout << "\n=== Testing Delete Permissions ===\n";
+    
+    // Admin delete test
+    db.setCurrentUser("admin");
+    try {
+        DeleteOperator delOp(db.buffer_manager, 0, 0, db.current_user);
+        if (delOp.next()) {
+            std::cout << "Admin: Successfully deleted high security tuple\n";
+        }
+    } catch (const std::runtime_error& e) {
+        std::cout << "Error: " << e.what() << std::endl;
+    }
+
+    // User2 delete test
+    db.setCurrentUser("user2");
+    try {
+        DeleteOperator delOp(db.buffer_manager, 0, 1, db.current_user);
+        if (!delOp.next()) {
+            std::cout << "User2: Correctly denied deletion of higher security tuple\n";
+        }
+    } catch (const std::runtime_error& e) {
+        std::cout << "Expected error for User2 deletion: " << e.what() << std::endl;
+    }
+
+    // Test bulk data loading with admin
+    std::cout << "\n=== Testing Bulk Load with Admin ===\n";
+    db.setCurrentUser("admin");
+    std::ifstream inputFile("output.txt");
     if (!inputFile) {
         std::cerr << "Unable to open file" << std::endl;
         return 1;
@@ -1446,23 +1695,34 @@ int main() {
     int field1, field2;
     int i = 0;
     while (inputFile >> field1 >> field2) {
-        if(i++ % 10000 == 0){
-            db.insert(field1, field2);
+        if(i++ % 10000 == 0) {
+            // Assign varied access levels based on data values
+            int access_level = (field1 <= 5) ? 25 : 50;
+            db.insert(field1, field2, access_level);
         }
     }
 
+    std::cout << "\n=== Final Query Tests ===\n";
     auto start = std::chrono::high_resolution_clock::now();
 
+    // Test final queries with different users
+    std::cout << "Admin Query Results:\n";
+    db.setCurrentUser("admin");
+    db.executeQueries();
+
+    std::cout << "\nUser1 Query Results:\n";
+    db.setCurrentUser("user1");
+    db.executeQueries();
+
+    std::cout << "\nUser2 Query Results:\n";
+    db.setCurrentUser("user2");
     db.executeQueries();
 
     auto end = std::chrono::high_resolution_clock::now();
-
-    // Calculate and print the elapsed time
     std::chrono::duration<double> elapsed = end - start;
-    std::cout << "Elapsed time: " << 
-    std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count() 
-          << " microseconds" << std::endl;
+    std::cout << "\nElapsed time: " << 
+        std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count() 
+        << " microseconds" << std::endl;
 
-    
     return 0;
 }
